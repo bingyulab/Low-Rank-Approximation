@@ -1,0 +1,586 @@
+import numpy as np
+from scipy.linalg import svd, qr, interpolative
+try: 
+    from sklearn.utils.extmath import randomized_svd
+    from sklearn.kernel_approximation import Nystroem
+except ImportError:
+    print("sklearn not installed. Installing using pip install scikit-learn")
+    import subprocess
+    subprocess.check_call(["pip", "install", "scikit-learn"])
+    from sklearn.utils.extmath import randomized_svd
+    from sklearn.kernel_approximation import Nystroem
+from PIL import Image
+import os
+
+try:
+    import pymanopt
+    from pymanopt.manifolds import Grassmann, FixedRankEmbedded
+    from pymanopt.optimizers import ConjugateGradient
+    import autograd.numpy as anp
+except ImportError:
+    print("pymanopt not installed. Installing using pip install pymanopt autograd")
+    import subprocess
+    subprocess.check_call(["pip", "install", "pymanopt"])
+    subprocess.check_call(["pip", "install", "autograd"])
+    import pymanopt
+    from pymanopt.manifolds import Grassmann, FixedRankEmbedded
+    from pymanopt.solvers import ConjugateGradient
+    import autograd.numpy as anp       
+
+
+# Set seed for reproducibility
+np.random.seed(42)
+
+# ---------------------------
+# 1. Synthetic Low-Rank Matrix
+# ---------------------------
+def generate_low_rank_matrix(m, n, r, noise_level=0.0):
+    U = np.random.randn(m, r)
+    V = np.random.randn(n, r)
+    A = U @ V.T
+    noise = noise_level * np.random.randn(m, n)
+    return A + noise
+
+# ---------------------------
+# 2. Real Image as Matrix
+# ---------------------------
+def load_image_as_matrix(path, size=(512, 512)):
+    img = Image.open(path).convert('L')  # Convert to grayscale
+    img = img.resize(size)
+    return np.array(img, dtype=np.float64)
+
+# ---------------------------
+# 3. Approximation Methods
+# ---------------------------
+
+def svd_approx(A, rank=None, max_iter=100, tol=1e-10):
+    """
+    Compute SVD decomposition from scratch using power iteration method.
+    
+    Parameters:
+    - A: input matrix of shape (m, n)
+    - rank: number of singular values/vectors to compute (default: min(m,n))
+    - max_iter: maximum iterations for power method convergence
+    - tol: tolerance for convergence
+    
+    Returns:
+    - U: left singular vectors
+    - S: singular values
+    - VT: right singular vectors transposed
+    """
+    A = np.array(A, dtype=float)  # ensure A is a numpy array with float dtype
+    m, n = A.shape
+    
+    if rank is None:
+        rank = min(m, n)
+    else:
+        rank = min(rank, min(m, n))
+    
+    # Initialize matrices to store results
+    U = np.zeros((m, rank))
+    S = np.zeros(rank)
+    VT = np.zeros((rank, n))
+    
+    # Make a copy of A to work with (we'll be deflating it)
+    A_work = A.copy()
+    
+    for k in range(rank):
+        # Initialize random vector for power iteration
+        v = np.random.randn(n)
+        v = v / np.linalg.norm(v)
+        
+        # Power iteration to find dominant right singular vector
+        for _ in range(max_iter):
+            # v ← A^T A v (power iteration for dominant eigenvector)
+            v_new = A_work.T @ (A_work @ v)
+            
+            # Normalize
+            v_new_norm = np.linalg.norm(v_new)
+            
+            # Handle the case of zero vector (can happen with deflation)
+            if v_new_norm < tol:
+                v_new = np.random.randn(n)
+                v_new = v_new / np.linalg.norm(v_new)
+            else:
+                v_new = v_new / v_new_norm
+            
+            # Check convergence
+            if np.linalg.norm(v_new - v) < tol:
+                v = v_new
+                break
+            
+            v = v_new
+        
+        # Compute singular value and left singular vector
+        u = A_work @ v
+        sigma = np.linalg.norm(u)
+        
+        # Handle near-zero singular values (numerical stability)
+        if sigma > tol:
+            u = u / sigma
+        else:
+            # If singular value is effectively zero, generate a random orthogonal vector
+            u = np.random.randn(m)
+            u = u / np.linalg.norm(u)
+        
+        # Store results
+        U[:, k] = u
+        S[k] = sigma
+        VT[k, :] = v
+        
+        # Deflate the matrix: A_k+1 = A_k - sigma_k * u_k * v_k^T
+        A_work = A_work - sigma * np.outer(u, v)
+        
+        # Reorthogonalize if numerical errors accumulate (optional)
+        if k > 0 and k % 10 == 0:  # every 10 iterations
+            # Reorthogonalize U
+            for i in range(k):
+                U[:, k] = U[:, k] - np.dot(U[:, k], U[:, i]) * U[:, i]
+            U[:, k] = U[:, k] / np.linalg.norm(U[:, k])
+            
+            # Reorthogonalize VT
+            for i in range(k):
+                VT[k, :] = VT[k, :] - np.dot(VT[k, :], VT[i, :]) * VT[i, :]
+            VT[k, :] = VT[k, :] / np.linalg.norm(VT[k, :])
+    
+    return U @ np.diag(S) @ VT
+
+def scipy_svd_approx(A, rank):
+    U, S, VT = svd(A, full_matrices=False)
+    return U[:, :rank] @ np.diag(S[:rank]) @ VT[:rank, :]
+
+# Manual implementation of randomized SVD (Algorithm 4.3 from Halko et al.)
+def rsvd_approx(A, rank, oversample=10, n_power_iter=2):
+    """
+    Implementation of the randomized SVD algorithm.
+    
+    Parameters:
+    - A: input matrix
+    - rank: target rank
+    - oversample: oversampling parameter (default: 10)
+    - n_power_iter: number of power iterations (default: 2)
+    """
+    m, n = A.shape
+    r = min(rank + oversample, min(m, n))
+    
+    # Step 1: Generate random Gaussian matrix
+    Omega = np.random.randn(n, r)
+    
+    # Step 2: Compute sampling matrix Y = A*Omega
+    Y = A @ Omega
+    
+    # Step 3: Optional power iterations to increase accuracy
+    for _ in range(n_power_iter):
+        Y = A @ (A.T @ Y)
+    
+    # Step 4: Compute orthogonal basis Q via QR decomposition
+    Q, _ = np.linalg.qr(Y, mode='reduced')
+    
+    # Step 5: Compute small matrix B = Q^T * A 
+    B = Q.T @ A
+    
+    # Step 6: SVD of small matrix B
+    U_B, S, Vt = np.linalg.svd(B, full_matrices=False)
+    
+    # Step 7: Recover left singular vectors
+    U = Q @ U_B
+    
+    # Return only the desired rank
+    return U[:, :rank] @ np.diag(S[:rank]) @ Vt[:rank, :]
+
+def sklearn_rsvd_approx(A, rank):    
+    U, S, VT = randomized_svd(A, n_components=rank)
+    return U @ np.diag(S) @ VT
+
+
+def cur_approx(A, rank, oversample=2, leverage=True):
+    """
+    CUR with optional oversampling and leverage‐score sampling.
+      rank       = target CUR rank
+      oversample = pick c = min(n, oversample*rank) cols (and similarly rows)
+      leverage   = if True, use top‐rank SVD to form sampling probs
+                   else, use plain column/row norms.
+    """
+    m, n = A.shape
+    c = min(n, oversample * rank)
+    r = min(m, oversample * rank)
+
+    # 1) compute sampling probabilities
+    if leverage:
+        # top‐rank SVD
+        U_r, S_r, Vt_r = svd(A, full_matrices=False)
+        U_r = U_r[:, :rank]
+        Vt_r = Vt_r[:rank, :]
+        p_cols = np.sum(Vt_r**2, axis=0) / rank
+        p_rows = np.sum(U_r**2, axis=1) / rank
+    else:
+        col_norms = np.linalg.norm(A, axis=0)
+        p_cols = col_norms / col_norms.sum()
+        row_norms = np.linalg.norm(A, axis=1)
+        p_rows = row_norms / row_norms.sum()
+
+    # 2) sample & form C
+    cols = np.random.choice(n, size=c, replace=False, p=p_cols)
+    C = A[:, cols] #/ np.sqrt(c * p_cols[cols])[None, :]
+
+    # 3) sample & form R
+    rows = np.random.choice(m, size=r, replace=False, p=p_rows)
+    R = A[rows, :] #/ np.sqrt(r * p_rows[rows])[:, None]
+
+    # 4) intersection & weight
+    W = A[np.ix_(rows, cols)]
+    # re‐normalize W
+    # W = W / (np.sqrt(r*p_rows[rows])[:,None] * np.sqrt(c*p_cols[cols])[None,:])
+    U = np.linalg.pinv(W)
+
+    # 5) reconstruct
+    return C @ U @ R
+
+def id_approx(A, rank):
+    # Interpolative decomposition via pivoted QR + reconstruction
+    # 1) pick the top‐rank pivot columns
+    Q, R, P = qr(A, mode='economic', pivoting=True)
+    cols = P[:rank]
+    C = A[:, cols]
+    # 2) solve for X in A ≈ C @ X
+    X = np.linalg.pinv(C) @ A
+    # 3) assemble the full‐size low‐rank approx
+    return C @ X
+
+# SciPy interpolative decomposition
+def scipy_id_approx(A, rank):
+    # Calculate ID decomposition
+    idx, proj = interpolative.interp_decomp(A, rank)
+    # Reconstruct approximation
+    B = interpolative.reconstruct_matrix_from_id(A[:, idx[:rank]], idx, proj)
+    return B
+
+def nystrom_approx(A, rank, symmetrize='AAT'):
+    """
+    Approximates the *kernel* K via Nyström, where
+    symmetrize = 'AAT'   → K = A @ A.T
+                = 'sym'   → K = (A + A.T)/2
+    Returns the low-rank approximation of K.
+    """
+    # 1) form symmetric K
+    if symmetrize == 'AAT':
+        K = A @ A.T
+    elif symmetrize == 'sym':
+        K = 0.5 * (A + A.T)
+    else:
+        raise ValueError("symmetrize must be 'AAT' or 'sym'")
+
+    # 2) sample columns of K
+    n = K.shape[1]
+    cols = np.random.choice(n, size=rank, replace=False)
+
+    # 3) extract C and W from K
+    C = K[:, cols]
+    W = K[np.ix_(cols, cols)]
+
+    # 4) Nyström reconstruction of K
+    W_pinv = np.linalg.pinv(W)
+    K_approx = C @ W_pinv @ C.T
+
+    return K_approx
+
+
+def manifold_approx(A, rank, max_iter=100, tol=1e-8):
+    """
+    Approximates matrix A using a simple manifold optimization approach.
+    For a full implementation, consider using pymanopt or similar libraries.
+    """
+    m, n = A.shape
+    
+    # Initialize random orthogonal matrices
+    U,_ = np.linalg.qr(np.random.randn(m,rank))
+    V,_ = np.linalg.qr(np.random.randn(n,rank))
+    for _ in range(max_iter):
+        U_new,_ = np.linalg.qr(A @ V)       # since V^T V = I
+        V_new,_ = np.linalg.qr(A.T @ U_new) # since U_new^T U_new = I
+        if np.linalg.norm(U_new - U, 'fro')<tol and np.linalg.norm(V_new - V,'fro')<tol:
+            U, V = U_new, V_new
+            break
+        U, V = U_new, V_new
+    # recover the correct scaling via the r×r core S
+    S = U.T @ A @ V
+    return U @ S @ V.T
+
+
+def create_cost_and_derivates(manifold, matrix, backend):
+    euclidean_gradient = None
+
+    if backend == "autograd":
+
+        @pymanopt.function.autograd(manifold)
+        def cost(u, s, vt):
+            X = u @ anp.diag(s) @ vt
+            return anp.linalg.norm(X - matrix) ** 2
+    else:
+        raise ValueError(f"Unsupported backend '{backend}'")
+
+    return cost, euclidean_gradient
+
+
+def pymanopt_manifold_approx(A, rank):
+    """
+    Low-rank matrix approximation using pymanopt for manifold optimization.
+    This uses the Grassmann manifold for finding the optimal subspaces.
+    """            
+    m, n = A.shape
+    
+    # Define the manifold: Grassmann manifold
+    manifold = FixedRankEmbedded(m, n, rank)    
+    # manifold = FixedRankEmbedded(m, n, rank)
+        
+    cost, euclidean_gradient = create_cost_and_derivates(
+        manifold, A, 'autograd'
+    ) 
+    # Create problem
+    problem = pymanopt.Problem(manifold=manifold, cost=cost, euclidean_gradient=euclidean_gradient)
+    
+    # Choose solver (ConjugateGradient is typically more effective than SteepestDescent)
+    optimizer = ConjugateGradient(
+        verbosity=0,
+        beta_rule="PolakRibiere"  # This rule often performs well
+    )
+    
+    # Solve the optimization problem
+    u, s, vt = optimizer.run(problem).point
+    
+    # Return low-rank approximation
+    return u @ anp.diag(s) @ vt
+
+# ---------------------------
+# 4. Error Metrics
+# ---------------------------
+def rel_fro_error(A, A_approx):
+    return np.linalg.norm(A - A_approx, ord='fro') / np.linalg.norm(A, ord='fro')
+
+# ---------------------------
+# Run Experiments
+# ---------------------------
+
+if __name__ == '__main__':
+    import time
+    import matplotlib.pyplot as plt
+
+    # 1) parameters
+    synth_ranks = [5, 10, 20, 50]    
+    img_ranks = [10, 20, 30]   # pick one rank for image illustrations
+    
+    methods = {
+        'SVD': svd_approx,
+        'Scipy-SVD': scipy_svd_approx,
+        'rSVD': rsvd_approx,
+        'Sklearn-rSVD': sklearn_rsvd_approx,
+        'CUR': cur_approx,
+        'ID': id_approx,
+        'Scipy-ID': scipy_id_approx,
+        'nystrom': nystrom_approx,
+        'manifold': manifold_approx,
+        'Pymanopt-manifold': pymanopt_manifold_approx,
+    }
+    # 2) prepare storage
+    syn_results = {name: {'err':[], 'time':[]} for name in methods}
+    
+    # 3) loop over ranks on synthetic data
+    # 3a) loop over ranks on synthetic data
+    for r in synth_ranks:
+        A_syn = generate_low_rank_matrix(500, 500, r, noise_level=0.01)
+        for name, method in methods.items():
+            t0 = time.perf_counter()
+            if 'nystrom' in name:
+                # Nyström approximates K = A A^T
+                K    = A_syn @ A_syn.T
+                K_app = method(A_syn, r)
+                err  = rel_fro_error(K, K_app)
+            elif name == 'CUR':
+                K_app = method(A_syn, r, oversample=2, leverage=True)
+                err   = rel_fro_error(A_syn, K_app)
+            else:
+                A_app = method(A_syn, r)
+                err   = rel_fro_error(A_syn, A_app)
+            t1 = time.perf_counter()
+            syn_results[name]['err'].append(err)
+            syn_results[name]['time'].append(t1 - t0)
+
+    # 3b) loop over matrix dimensions using fixed rank
+    dimensions = [500, 1000, 3000, 5000]
+    fixed_rank = 20  # Use a moderate rank for dimension scaling tests
+    dim_results = {name: {'err':[], 'time':[]} for name in methods}
+    
+    for dim in dimensions:
+        print(f"Testing dimension {dim}x{dim} with rank {fixed_rank}...")
+        A_syn = generate_low_rank_matrix(dim, dim, fixed_rank, noise_level=0.01)
+        for name, method in methods.items():
+            try:
+                t0 = time.perf_counter()
+                if 'nystrom' in name:
+                    # Nyström approximates K = A A^T
+                    K    = A_syn @ A_syn.T
+                    K_app = method(A_syn, fixed_rank)
+                    err  = rel_fro_error(K, K_app)
+                elif name == 'CUR':
+                    K_app = method(A_syn, fixed_rank, oversample=2, leverage=True)
+                    err   = rel_fro_error(A_syn, K_app)
+                else:
+                    A_app = method(A_syn, fixed_rank)
+                    err   = rel_fro_error(A_syn, A_app)
+                t1 = time.perf_counter()
+                dim_results[name]['err'].append(err)
+                dim_results[name]['time'].append(t1 - t0)
+                print(f"  {name}: Error={err:.4f}, Time={t1-t0:.3f}s")
+            except Exception as e:
+                print(f"  {name} failed on dimension {dim}: {e}")
+                dim_results[name]['err'].append(None)
+                dim_results[name]['time'].append(None)
+
+    # 4) print summary tables
+    # Print rank comparison table
+    print("\n--- Rank Comparison ---")
+    header = ['rank'] + list(methods.keys())
+    print('\t'.join(header))
+    for i, r in enumerate(synth_ranks):
+        row = [str(r)]
+        for name in methods:
+            e = syn_results[name]['err'][i]
+            t = syn_results[name]['time'][i]
+            row.append(f"{e:.4f}/{t:.3f}s")
+        print('\t'.join(row))
+    
+    # Print dimension comparison table
+    print("\n--- Dimension Comparison ---")
+    header = ['dimension'] + list(methods.keys())
+    print('\t'.join(header))
+    for i, dim in enumerate(dimensions):
+        row = [f"{dim}x{dim}"]
+        for name in methods:
+            e = dim_results[name]['err'][i]
+            t = dim_results[name]['time'][i]
+            if e is not None and t is not None:
+                row.append(f"{e:.4f}/{t:.3f}s")
+            else:
+                row.append("failed")
+        print('\t'.join(row))
+    
+    # Create visualizations to compare methods across ranks
+    plt.figure(figsize=(12, 10))
+    
+    # 1. Error comparison by rank (line plot)
+    plt.subplot(2, 2, 1)
+    for name, result in syn_results.items():
+        plt.plot(synth_ranks, result['err'], marker='o', label=name)
+    plt.xlabel('Rank')
+    plt.ylabel('Relative Frobenius Error')
+    plt.title('Error vs Rank')
+    plt.grid(True)
+    plt.legend(loc='best', fontsize=8)
+    
+    # 2. Time comparison by rank (line plot)
+    plt.subplot(2, 2, 2)
+    for name, result in syn_results.items():
+        plt.plot(synth_ranks, result['time'], marker='o', label=name)
+    plt.xlabel('Rank')
+    plt.ylabel('Time (s)')
+    plt.title('Execution Time vs Rank')
+    plt.grid(True)
+    
+    # 3. Error comparison by dimension (line plot)
+    plt.subplot(2, 2, 3)
+    for name, result in dim_results.items():
+        valid_points = [(d, e) for d, e in zip(dimensions, result['err']) if e is not None]
+        if valid_points:
+            dims, errs = zip(*valid_points)
+            plt.plot(dims, errs, marker='o', label=name)
+    plt.xlabel('Matrix Dimension')
+    plt.ylabel('Relative Frobenius Error')
+    plt.title(f'Error vs Dimension (rank={fixed_rank})')
+    plt.grid(True)
+    
+    # 4. Time comparison by dimension (line plot)
+    plt.subplot(2, 2, 4)
+    for name, result in dim_results.items():
+        valid_points = [(d, t) for d, t in zip(dimensions, result['time']) if t is not None]
+        if valid_points:
+            dims, times = zip(*valid_points)
+            plt.plot(dims, times, marker='o', label=name)
+    plt.xlabel('Matrix Dimension')
+    plt.ylabel('Time (s)')
+    plt.title(f'Execution Time vs Dimension (rank={fixed_rank})')
+    plt.yscale('log')  # Log scale for better visibility
+    plt.grid(True)
+        
+    plt.tight_layout()
+    plt.savefig('method_comparison.png', dpi=300, bbox_inches='tight')
+    
+    # Create a separate figure for dimension scaling
+    plt.figure(figsize=(15, 6))
+    
+    # 1. Error comparison by dimension
+    plt.subplot(1, 2, 1)
+    for name, result in dim_results.items():
+        valid_points = [(d, e) for d, e in zip(dimensions, result['err']) if e is not None]
+        if valid_points:
+            dims, errs = zip(*valid_points)
+            plt.plot(dims, errs, marker='o', label=name)
+    plt.xlabel('Matrix Dimension')
+    plt.ylabel('Relative Frobenius Error')
+    plt.title(f'Error vs Dimension (rank={fixed_rank})')
+    plt.grid(True)
+    plt.legend()
+    
+    # 2. Time comparison by dimension with log scale for time
+    plt.subplot(1, 2, 2)
+    for name, result in dim_results.items():
+        valid_points = [(d, t) for d, t in zip(dimensions, result['time']) if t is not None]
+        if valid_points:
+            dims, times = zip(*valid_points)
+            plt.plot(dims, times, marker='o', label=name)
+    plt.xlabel('Matrix Dimension')
+    plt.ylabel('Time (s)')
+    plt.title(f'Execution Time vs Dimension (rank={fixed_rank})')
+    plt.yscale('log')  # Log scale for better visibility
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('dimension_scaling.png', dpi=300, bbox_inches='tight')
+
+    # 5) visualize image approximations at ranks [10,20,50]
+    img_path = '/Users/leonjiang/Library/Mobile Documents/iCloud~md~obsidian/Documents/Self-Knowledge/100 - Working | 工作/110 - Project/1104 -  Low-Rank Approximation/img/sample.jpg'
+    if os.path.exists(img_path):
+        A_img = load_image_as_matrix(img_path)
+    else:
+        A_img = generate_low_rank_matrix(512, 512,  max(img_ranks))
+
+    # only methods that approximate A directly
+    methods_img = {k:methods[k] for k in methods if k!='nystrom' and '-' not in k}
+
+    nrows, ncols = len(img_ranks), len(methods_img) + 1
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(4*ncols, 3*nrows),
+                             squeeze=False)
+
+    for i, rk in enumerate(img_ranks):
+        # original in first column
+        ax = axes[i,0]
+        ax.imshow(A_img, cmap='gray')
+        ax.set_title(f'Original\n(>={rk})')
+        ax.axis('off')
+
+        # approximations
+        for j, (name, method) in enumerate(methods_img.items(), start=1):
+            if name == 'CUR':
+                K_app = method(A_img, rk, oversample=2, leverage=True)
+            else:
+                A_ap = method(A_img, rk)
+            ax = axes[i,j]
+            ax.imshow(A_ap, cmap='gray')
+            ax.set_title(f'{name}\nrank={rk}')
+            ax.axis('off')
+
+    plt.tight_layout()
+    # Save the figure
+    plt.savefig('low_rank_approximation_results.png', dpi=300, bbox_inches='tight')
+    plt.show()
