@@ -2,10 +2,19 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+*latex*
+*.log
+*.nav
+*.snm
+*.fls
+*.out
+*.aux
+*.gz
+*.toc
+*.vrb
 # C extensions
 *.so
-
+_minted*
 # Distribution / packaging
 .Python
 build/
@@ -172,3 +181,4 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
