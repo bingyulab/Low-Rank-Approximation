@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from scipy.linalg import svd, qr, interpolative
 try: 
@@ -10,7 +11,6 @@ except ImportError:
     from sklearn.utils.extmath import randomized_svd
     from sklearn.kernel_approximation import Nystroem
 from PIL import Image
-import os
 
 try:
     import pymanopt
@@ -27,7 +27,13 @@ except ImportError:
     from pymanopt.optimizers import ConjugateGradient
     import autograd.numpy as anp       
 
-
+try:
+    import torch
+except:
+    import subprocess
+    subprocess.check_call(["pip", "install", "pytorch"])
+    import torch
+    
 # Set seed for reproducibility
 np.random.seed(42)
 
@@ -284,27 +290,121 @@ def nystrom_approx(A, rank, symmetrize='AAT'):
 
     return K_approx
 
-
-def manifold_approx(A, rank, max_iter=100, tol=1e-8):
+def manifold_approx(
+        A,
+        rank,
+        n_steps=200,
+        lr=5e-3,
+        K=5,
+        tol=1e-7
+    ):
     """
-    Approximates matrix A using a simple manifold optimization approach.
-    For a full implementation, consider using pymanopt or similar libraries.
+    Low-rank matrix approximation using Riemannian optimization on the manifold of fixed-rank matrices.
+    Parameters:
+    -----------
+    A : array-like - Input matrix to approximate
+    rank : int - Target rank for the approximation
+    n_steps : int, optional - Number of optimization steps (default: 200)
+    lr : float, optional - Learning rate for optimizer (default: 5e-3)
+    K : int, optional - Frequency of retraction to the manifold (default: 5)
+    tol : float, optional - Tolerance for early stopping (default: 1e-7)
+    Returns: array-like - Low-rank approximation of A
     """
+    # Input validation
+    if rank <= 0 or rank > min(A.shape):
+        raise ValueError(f"Rank must be between 1 and min(A.shape)={min(A.shape)}")
     m, n = A.shape
+    r = rank 
     
-    # Initialize random orthogonal matrices
-    U,_ = np.linalg.qr(np.random.randn(m,rank))
-    V,_ = np.linalg.qr(np.random.randn(n,rank))
-    for _ in range(max_iter):
-        U_new,_ = np.linalg.qr(A @ V)       # since V^T V = I
-        V_new,_ = np.linalg.qr(A.T @ U_new) # since U_new^T U_new = I
-        if np.linalg.norm(U_new - U, 'fro')<tol and np.linalg.norm(V_new - V,'fro')<tol:
-            U, V = U_new, V_new
+    # Convert numpy array to torch tensor
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    A_t = torch.tensor(A, dtype=torch.float32, device=device)
+    
+    # Initialize factors using SVD for better starting point
+    try:
+        # Use randomized SVD for initialization if matrix is large
+        if max(m, n) > 1000:
+            U, S, VT = randomized_svd(A, n_components=r)
+        else:
+            U, S, VT = svd(A, full_matrices=False)
+        
+        # Take only the top r components
+        U_r = U[:, :r]
+        S_r = S[:r]
+        VT_r = VT[:r, :]
+        
+        # Initialize B and C using SVD factors
+        sqrt_S = np.sqrt(S_r)
+        B_init = U_r * sqrt_S[None, :]
+        C_init = VT_r.T * sqrt_S[None, :]
+        
+        B = torch.tensor(B_init, dtype=torch.float32, device=device, requires_grad=True)
+        C = torch.tensor(C_init, dtype=torch.float32, device=device, requires_grad=True)
+    except:
+        # Fallback to random initialization if SVD fails
+        B = torch.randn(m, r, device=device, requires_grad=True)
+        C = torch.randn(n, r, device=device, requires_grad=True)
+    
+    # Use Adam optimizer instead of SGD for better convergence
+    optimizer = torch.optim.Adam([B, C], lr=lr, weight_decay=1e-5)
+    
+    prev_loss = float('inf')
+    patience = 0
+    max_patience = 5  # Allow a few iterations without improvement
+    
+    for step in range(n_steps):
+        optimizer.zero_grad()        
+        # Current approximation
+        A_hat = B @ C.T
+        # Frobenius-norm loss
+        loss = torch.norm(A_hat - A_t, p='fro')**2
+        
+        # Detect explosion early
+        if not torch.isfinite(loss):
+            print(f"Loss went non-finite at step {step}")
             break
-        U, V = U_new, V_new
-    # recover the correct scaling via the r×r core S
-    S = U.T @ A @ V
-    return U @ S @ V.T
+            
+        loss.backward()        
+        torch.nn.utils.clip_grad_norm_([B, C], max_norm=10.0)
+        optimizer.step()
+        
+        # Do Riemannian-style step (retracting to the manifold)
+        if (step + 1) % K == 0:
+            with torch.no_grad():
+                # QR on B and C
+                Qb, Rb = torch.linalg.qr(B, mode='reduced')
+                Qc, Rc = torch.linalg.qr(C, mode='reduced')
+                
+                # Form small matrix S = Rb @ Rc^T
+                S = Rb @ Rc.T
+                
+                # Check for non-finite values and replace them
+                if not torch.all(torch.isfinite(S)):
+                    S = torch.where(torch.isfinite(S), S, torch.zeros_like(S))
+                
+                # Add small regularization for numerical stability
+                S = S + 1e-8 * torch.eye(r, device=device)
+                
+                # SVD of the small core
+                U_s, S_s, Vh_s = torch.linalg.svd(S, full_matrices=False)
+                sqrtS = torch.diag(torch.sqrt(S_s))
+                B.copy_(Qb @ U_s @ sqrtS)
+                C.copy_(Qc @ Vh_s.T @ sqrtS)
+        
+        # Early stopping with patience
+        curr = loss.item()
+        improvement = prev_loss - curr
+        if improvement < tol:
+            patience += 1
+            if patience >= max_patience:
+                break
+        else:
+            patience = 0
+            
+        prev_loss = curr
+    
+    # Return the approximation
+    return (B @ C.T).detach().cpu().numpy()
 
 
 def create_cost_and_derivates(manifold, matrix, backend):

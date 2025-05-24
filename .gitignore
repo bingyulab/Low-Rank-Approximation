@@ -12,6 +12,11 @@ __pycache__/
 *.gz
 *.toc
 *.vrb
+*.bbl
+*.bbl-SAVE-ERROR
+*.bcf
+*.blg
+*.run.xml
 # C extensions
 *.so
 _minted*
