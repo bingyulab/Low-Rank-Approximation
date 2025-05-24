@@ -24,7 +24,7 @@ except ImportError:
     subprocess.check_call(["pip", "install", "autograd"])
     import pymanopt
     from pymanopt.manifolds import Grassmann, FixedRankEmbedded
-    from pymanopt.solvers import ConjugateGradient
+    from pymanopt.optimizers import ConjugateGradient
     import autograd.numpy as anp       
 
 
@@ -363,8 +363,10 @@ def rel_fro_error(A, A_approx):
 
 if __name__ == '__main__':
     import time
-    import matplotlib.pyplot as plt
-
+    import matplotlib.pyplot as plt    
+    import seaborn as sns
+    import pandas as pd
+    
     # 1) parameters
     synth_ranks = [5, 10, 20, 50]    
     img_ranks = [10, 20, 30]   # pick one rank for image illustrations
@@ -382,8 +384,9 @@ if __name__ == '__main__':
         'Pymanopt-manifold': pymanopt_manifold_approx,
     }
     # 2) prepare storage
-    syn_results = {name: {'err':[], 'time':[]} for name in methods}
-    
+    syn_errs_results = {name: [] for name in methods}
+    syn_rn_results = {name: [] for name in methods}
+
     # 3) loop over ranks on synthetic data
     # 3a) loop over ranks on synthetic data
     for r in synth_ranks:
@@ -402,39 +405,35 @@ if __name__ == '__main__':
                 A_app = method(A_syn, r)
                 err   = rel_fro_error(A_syn, A_app)
             t1 = time.perf_counter()
-            syn_results[name]['err'].append(err)
-            syn_results[name]['time'].append(t1 - t0)
+            syn_errs_results[name].append(err)
+            syn_rn_results[name].append(t1 - t0)
 
     # 3b) loop over matrix dimensions using fixed rank
     dimensions = [500, 1000, 3000, 5000]
     fixed_rank = 20  # Use a moderate rank for dimension scaling tests
-    dim_results = {name: {'err':[], 'time':[]} for name in methods}
-    
+    dim_errs_results = {name: [] for name in methods}
+    dim_rn_results = {name: [] for name in methods}
+
     for dim in dimensions:
         print(f"Testing dimension {dim}x{dim} with rank {fixed_rank}...")
         A_syn = generate_low_rank_matrix(dim, dim, fixed_rank, noise_level=0.01)
         for name, method in methods.items():
-            try:
-                t0 = time.perf_counter()
-                if 'nystrom' in name:
-                    # Nyström approximates K = A A^T
-                    K    = A_syn @ A_syn.T
-                    K_app = method(A_syn, fixed_rank)
-                    err  = rel_fro_error(K, K_app)
-                elif name == 'CUR':
-                    K_app = method(A_syn, fixed_rank, oversample=2, leverage=True)
-                    err   = rel_fro_error(A_syn, K_app)
-                else:
-                    A_app = method(A_syn, fixed_rank)
-                    err   = rel_fro_error(A_syn, A_app)
-                t1 = time.perf_counter()
-                dim_results[name]['err'].append(err)
-                dim_results[name]['time'].append(t1 - t0)
-                print(f"  {name}: Error={err:.4f}, Time={t1-t0:.3f}s")
-            except Exception as e:
-                print(f"  {name} failed on dimension {dim}: {e}")
-                dim_results[name]['err'].append(None)
-                dim_results[name]['time'].append(None)
+            t0 = time.perf_counter()
+            if 'nystrom' in name:
+                # Nyström approximates K = A A^T
+                K    = A_syn @ A_syn.T
+                K_app = method(A_syn, fixed_rank)
+                err  = rel_fro_error(K, K_app)
+            elif name == 'CUR':
+                K_app = method(A_syn, fixed_rank, oversample=2, leverage=True)
+                err   = rel_fro_error(A_syn, K_app)
+            else:
+                A_app = method(A_syn, fixed_rank)
+                err   = rel_fro_error(A_syn, A_app)
+            t1 = time.perf_counter()
+            dim_errs_results[name].append(err)
+            dim_rn_results[name].append(t1 - t0)
+            print(f"  {name}: Error={err:.4f}, Time={t1-t0:.3f}s")
 
     # 4) print summary tables
     # Print rank comparison table
@@ -444,8 +443,8 @@ if __name__ == '__main__':
     for i, r in enumerate(synth_ranks):
         row = [str(r)]
         for name in methods:
-            e = syn_results[name]['err'][i]
-            t = syn_results[name]['time'][i]
+            e = syn_errs_results[name][i]
+            t = syn_rn_results[name][i]
             row.append(f"{e:.4f}/{t:.3f}s")
         print('\t'.join(row))
     
@@ -456,21 +455,61 @@ if __name__ == '__main__':
     for i, dim in enumerate(dimensions):
         row = [f"{dim}x{dim}"]
         for name in methods:
-            e = dim_results[name]['err'][i]
-            t = dim_results[name]['time'][i]
+            e = dim_errs_results[name][i]
+            t = dim_rn_results[name][i]
             if e is not None and t is not None:
                 row.append(f"{e:.4f}/{t:.3f}s")
             else:
                 row.append("failed")
         print('\t'.join(row))
     
+    
+    # Create dataframes for dimension results
+    df_err_dim = pd.DataFrame(dim_errs_results, index=dimensions)
+    df_rt_dim = pd.DataFrame(dim_rn_results, index=dimensions)
+
+    df_err_rank = pd.DataFrame(syn_errs_results, index=synth_ranks)
+    df_rt_rank = pd.DataFrame(syn_rn_results, index=synth_ranks)
+
+    # Heat-maps for dimension results
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,2,1)
+    sns.heatmap(df_err_dim.T, annot=True, fmt=".4f", cmap="YlGnBu", cbar_kws={'label':'Error'})
+    plt.title("Relative Error vs. Dimension")
+    plt.xlabel("Dimension"); plt.ylabel("Method")
+
+    plt.subplot(1,2,2)
+    sns.heatmap(df_rt_dim.T, annot=True, fmt=".3f", cmap="YlOrRd", cbar_kws={'label':'Time (s)'})
+    plt.title("Runtime vs. Dimension")
+    plt.xlabel("Dimension"); plt.ylabel("")
+
+    plt.tight_layout()
+    plt.savefig("img/dimension_heatmaps.png", dpi=200)
+    plt.close()
+
+    # Heat-maps for dimenRanksion results
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,2,1)
+    sns.heatmap(df_err_rank.T, annot=True, fmt=".4f", cmap="YlGnBu", cbar_kws={'label':'Error'})
+    plt.title("Relative Error vs. Rank")
+    plt.xlabel("Rank"); plt.ylabel("Method")
+
+    plt.subplot(1,2,2)
+    sns.heatmap(df_rt_rank.T, annot=True, fmt=".3f", cmap="YlOrRd", cbar_kws={'label':'Time (s)'})
+    plt.title("Runtime vs. Rank")
+    plt.xlabel("Rank"); plt.ylabel("")
+
+    plt.tight_layout()
+    plt.savefig("img/rank_heatmaps.png", dpi=200)
+    plt.close()
+    
     # Create visualizations to compare methods across ranks
     plt.figure(figsize=(12, 10))
     
     # 1. Error comparison by rank (line plot)
     plt.subplot(2, 2, 1)
-    for name, result in syn_results.items():
-        plt.plot(synth_ranks, result['err'], marker='o', label=name)
+    for name, result in syn_errs_results.items():
+        plt.plot(synth_ranks, result, marker='o', label=name)
     plt.xlabel('Rank')
     plt.ylabel('Relative Frobenius Error')
     plt.title('Error vs Rank')
@@ -479,8 +518,8 @@ if __name__ == '__main__':
     
     # 2. Time comparison by rank (line plot)
     plt.subplot(2, 2, 2)
-    for name, result in syn_results.items():
-        plt.plot(synth_ranks, result['time'], marker='o', label=name)
+    for name, result in syn_rn_results.items():
+        plt.plot(synth_ranks, result, marker='o', label=name)
     plt.xlabel('Rank')
     plt.ylabel('Time (s)')
     plt.title('Execution Time vs Rank')
@@ -488,20 +527,20 @@ if __name__ == '__main__':
     
     # 3. Error comparison by dimension (line plot)
     plt.subplot(2, 2, 3)
-    for name, result in dim_results.items():
-        valid_points = [(d, e) for d, e in zip(dimensions, result['err']) if e is not None]
+    for name, result in dim_errs_results.items():
+        valid_points = [(d, e) for d, e in zip(dimensions, result) if e is not None]
         if valid_points:
             dims, errs = zip(*valid_points)
             plt.plot(dims, errs, marker='o', label=name)
     plt.xlabel('Matrix Dimension')
     plt.ylabel('Relative Frobenius Error')
     plt.title(f'Error vs Dimension (rank={fixed_rank})')
-    plt.grid(True)
-    
+    plt.grid(True)    
+
     # 4. Time comparison by dimension (line plot)
     plt.subplot(2, 2, 4)
-    for name, result in dim_results.items():
-        valid_points = [(d, t) for d, t in zip(dimensions, result['time']) if t is not None]
+    for name, result in dim_rn_results.items():
+        valid_points = [(d, t) for d, t in zip(dimensions, result) if t is not None]
         if valid_points:
             dims, times = zip(*valid_points)
             plt.plot(dims, times, marker='o', label=name)
@@ -509,18 +548,18 @@ if __name__ == '__main__':
     plt.ylabel('Time (s)')
     plt.title(f'Execution Time vs Dimension (rank={fixed_rank})')
     plt.yscale('log')  # Log scale for better visibility
-    plt.grid(True)
+    plt.grid(True)    
         
     plt.tight_layout()
-    plt.savefig('method_comparison.png', dpi=300, bbox_inches='tight')
+    plt.savefig('img/method_comparison.png', dpi=300, bbox_inches='tight')
     
     # Create a separate figure for dimension scaling
     plt.figure(figsize=(15, 6))
     
     # 1. Error comparison by dimension
     plt.subplot(1, 2, 1)
-    for name, result in dim_results.items():
-        valid_points = [(d, e) for d, e in zip(dimensions, result['err']) if e is not None]
+    for name, result in dim_errs_results.items():
+        valid_points = [(d, e) for d, e in zip(dimensions, result) if e is not None]
         if valid_points:
             dims, errs = zip(*valid_points)
             plt.plot(dims, errs, marker='o', label=name)
@@ -532,8 +571,8 @@ if __name__ == '__main__':
     
     # 2. Time comparison by dimension with log scale for time
     plt.subplot(1, 2, 2)
-    for name, result in dim_results.items():
-        valid_points = [(d, t) for d, t in zip(dimensions, result['time']) if t is not None]
+    for name, result in dim_rn_results.items():
+        valid_points = [(d, t) for d, t in zip(dimensions, result) if t is not None]
         if valid_points:
             dims, times = zip(*valid_points)
             plt.plot(dims, times, marker='o', label=name)
@@ -545,10 +584,10 @@ if __name__ == '__main__':
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig('dimension_scaling.png', dpi=300, bbox_inches='tight')
+    plt.savefig('img/dimension_scaling.png', dpi=300, bbox_inches='tight')
 
     # 5) visualize image approximations at ranks [10,20,50]
-    img_path = '/Users/leonjiang/Library/Mobile Documents/iCloud~md~obsidian/Documents/Self-Knowledge/100 - Working | 工作/110 - Project/1104 -  Low-Rank Approximation/img/sample.jpg'
+    img_path = 'img/sample.jpg'
     if os.path.exists(img_path):
         A_img = load_image_as_matrix(img_path)
     else:
@@ -582,5 +621,6 @@ if __name__ == '__main__':
 
     plt.tight_layout()
     # Save the figure
-    plt.savefig('low_rank_approximation_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.savefig('img/low_rank_approximation_results.png', dpi=300, bbox_inches='tight')
+    plt.show()    
+    
